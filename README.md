@@ -1,71 +1,98 @@
 # MKV Track Stripper & Library Cleaner
 
-A collection of ultra-resilient, self-contained Python scripts designed to automate the stripping of unwanted audio and subtitle tracks from MKV files. These tools interact seamlessly with SABnzbd and Radarr to optimize disk space and enforce language preferences without interrupting your automated media pipeline.
+Every movie you grab shows up bloated: five audio tracks you'll never play, a commentary track, a "descriptive audio" track, and subtitles in nine languages you don't speak. One file, whatever. Multiply it across a whole library and you're burning real disk space on tracks nobody in your house will ever touch.
+
+These two self-contained Python scripts fix that. They strip MKV files down to the audio and subtitle languages you actually want, then hand the clean file back to your pipeline like nothing happened. One runs as a SABnzbd post-processing hook, so files get cleaned the moment they land and before Radarr or Sonarr imports them. The other sweeps your existing library on a schedule and cleans up everything you already have.
+
+The whole thing is built to never break your automation. If anything goes wrong, the original file is left untouched and the script exits cleanly. A failed strip is a no-op, not a stalled queue.
+
+**Requirements:** Python 3.10+ and MKVToolNix (`mkvmerge`). See [Prerequisites](#prerequisites).
+
+## Contents
+
+- [MKV Track Stripper \& Library Cleaner](#mkv-track-stripper--library-cleaner)
+  - [Contents](#contents)
+  - [Features](#features)
+    - [Extra cleanup passes](#extra-cleanup-passes)
+  - [1. Automated Hook: `mkv_strip_pp.py`](#1-automated-hook-mkv_strip_pppy)
+    - [SABnzbd setup](#sabnzbd-setup)
+    - [Docker (LinuxServer.io SABnzbd)](#docker-linuxserverio-sabnzbd)
+    - [Manual configuration](#manual-configuration)
+  - [2. Library Sweep Engine: `mkvclean.py`](#2-library-sweep-engine-mkvcleanpy)
+    - [How it stays out of its own way](#how-it-stays-out-of-its-own-way)
+    - [Usage examples](#usage-examples)
+    - [Scheduled catch-all cron configuration](#scheduled-catch-all-cron-configuration)
+  - [CLI Arguments](#cli-arguments)
+  - [Prerequisites](#prerequisites)
+  - [Troubleshooting](#troubleshooting)
+    - [`Could not preserve ownership (uid=… gid=…) … Operation not permitted`](#could-not-preserve-ownership-uid-gid--operation-not-permitted)
+  - [License](#license)
 
 ## Features
-- Language-Based Filtering: Keeps only your preferred languages (e.g., English and Japanese) and strips everything else.
-- Dynamic Undetermined (und) Track Handling: Retains undetermined tracks only if your primary language (English) is missing or if it is the sole audio track in the file (preventing silent movies).
-- Automated Auxiliary Preservation: Automatically protects forced subtitle tracks — detected via the `forced_track` flag or a "forced" marker in the track name — regardless of their language tag.
-- Junk Track Discrimination: Automatically detects and strips commentary, director's notes, descriptive audio, and DVS tracks (both scripts).
-- Default Audio Enforcement: Sets the first kept audio track as the sole default and explicitly clears the default flag on every other kept audio track, so a stale flag carried over from the source can't leave two defaults.
-- Extra Cleanup Passes: Normalizes cosmetic/structural metadata alongside the track strip — removes the global container title (usually a release-group filename), wipes global and per-track tags, clears junk track names (commentary/SDH/etc) on kept tracks, and fills an undefined (`und`) track language from a language word in its name (e.g. "English" → `eng`) *before* the language filter runs so the fix actually feeds selection. Optionally drops attachments (cover art / embedded fonts), off by default since fonts can matter for styled subtitles. Title/tags/language-fill/junk-name passes are on by default; each is individually toggleable (CLI flags on `mkvclean`, config constants in `mkv_strip_pp.py`). These run on both the full-remux and the in-place `mkvpropedit` fast-path.
-- Metadata-Only Fast-Path: When a file has no tracks to strip but its header is still wrong — a missing/duplicate default-audio flag or a junk global title — it is fixed in place with `mkvpropedit` instead of a full remux. The edit touches only the header on the existing file, so there's no temp file, atomic swap, or disk-space check, and ownership/permissions/ACLs are preserved inherently.
-- Metadata Preservation: After the atomic swap, restores the original ownership, permissions, timestamps, extended attributes, and POSIX ACLs onto the cleaned file. If ownership can't be restored (e.g. running as a non-root user) it logs a warning and continues rather than failing.
-- Verified Output Before Swap: Before the cleaned file replaces the original, it is re-probed with `mkvmerge -J` to confirm it still carries a video track and exactly the audio/subtitle track counts that were requested. If the re-probe fails or the counts don't match, the original is kept and the error is logged — guarding against a truncated-but-nonzero remux silently overwriting a good source.
-- Atomic Swapping & Zero-Copy Safety: Executes remuxing directly inside the file's current directory using mkvmerge. The final file is atomically swapped into place, eliminating cross-device link errors (EXDEV) across UnionFS/MergerFS/ZFS pools.
-- Non-Blocking Execution Philosophy: If an error occurs or mkvmerge fails, the original file is left completely intact, the error is logged, and the script exits gracefully (0) so the automation pipeline never stalls.
+
+- **Language-based filtering:** keeps only the languages you ask for (say, English and Japanese) and drops the rest.
+- **Undetermined (`und`) track handling:** `und` tracks are a coin flip, so the script only keeps them when it has to: when your primary language is missing, or when it's the only audio track in the file. No accidental silent movies.
+- **Forced-subtitle preservation:** forced subs survive no matter what language they're tagged as, detected through the `forced_track` flag or a "forced" marker in the track name. Those are the subs that translate the one line of Elvish, and you do not want to lose them.
+- **Junk-track discrimination:** commentary, director's notes, descriptive audio, and DVS tracks get stripped automatically (both scripts).
+- **Default-audio enforcement:** the first kept audio track becomes the sole default, and the default flag is explicitly cleared on every other kept audio track. A stale flag carried over from the source can't leave you with two defaults fighting each other.
+- **Metadata-only fast-path:** sometimes a file has nothing to strip but its header is still wrong (missing or duplicate default-audio flag, junk global title). Instead of remuxing the whole thing, it gets patched in place with `mkvpropedit`. That means no temp file, no atomic swap, no disk-space check, and ownership/permissions/ACLs are preserved for free because the file never moves.
+- **Verified output before swap:** before a cleaned file replaces the original, it's re-probed with `mkvmerge -J` to confirm it still has a video track and exactly the audio/subtitle counts that were requested. If the re-probe fails or the numbers don't add up, the original stays put and the error is logged. This is the guard against a truncated-but-nonzero remux quietly overwriting a perfectly good source.
+- **Metadata preservation:** after the swap, the original ownership, permissions, timestamps, extended attributes, and POSIX ACLs are copied back onto the cleaned file. If ownership can't be restored (you're not root, you don't own the files) it logs a warning and keeps going instead of falling over.
+- **Atomic swapping and zero-copy safety:** remuxing happens right inside the file's own directory, then the result is atomically swapped into place. No cross-device link errors when your storage is a UnionFS, MergerFS, or ZFS pool.
+- **Non-blocking by design:** if `mkvmerge` fails or anything throws an error, the original file is left completely intact, the error goes to the log, and the script exits 0. Your pipeline never stalls waiting on a file that wouldn't cooperate.
+
+### Extra cleanup passes
+
+While it's in there stripping tracks, the script also tidies up the cosmetic and structural metadata that release groups leave lying around:
+
+- Removes the global container title (usually the release-group filename).
+- Wipes global and per-track tags.
+- Clears junk track names (commentary, SDH, etc.) on the tracks it keeps.
+- Fills in an undefined (`und`) track language from a language word in its name ("English" becomes `eng`). This one runs **before** the language filter on purpose, otherwise the fix would happen too late to actually affect which tracks get kept.
+- Optionally drops attachments (cover art and embedded fonts). This is off by default, because those fonts can matter for styled subtitles and ripping them out can wreck how ASS/SSA subs render.
+
+The title, tags, language-fill, and junk-name passes are all on by default and each one is individually toggleable (CLI flags on `mkvclean.py`, config constants in `mkv_strip_pp.py`). They run on both the full remux and the in-place `mkvpropedit` fast-path.
 
 ## 1. Automated Hook: `mkv_strip_pp.py`
-   This script integrates directly into SABnzbd as a post-processing script. It cleans files immediately after downloading and before Radarr attempts to import them.
-   
-### SABnzbd Setup
-Place `mkv_strip_pp.py` into your SABnzbd scripts directory.
-Make the script executable:
-```Bash
+
+This is the one that runs inside SABnzbd as a post-processing script. It cleans files the moment they finish downloading, before Radarr ever sees them, so the file that lands in your library is already clean.
+
+### SABnzbd setup
+
+Drop `mkv_strip_pp.py` into your SABnzbd scripts directory and make it executable:
+
+```bash
 chmod +x mkv_strip_pp.py
 ```
 
-In the SABnzbd Web UI, assign the script to your specific movie or TV categories.
+Then head into the SABnzbd web UI and assign the script to your movie and/or TV categories. Done.
 
 ### Docker (LinuxServer.io SABnzbd)
 
-The stock `lscr.io/linuxserver/sabnzbd` image does not include `mkvmerge`. The included `Dockerfile` extends it and bakes in the required tooling:
+Heads up: the stock `lscr.io/linuxserver/sabnzbd` image doesn't ship `mkvmerge`, so the script has nothing to call. The included `Dockerfile` extends the image and bakes the tooling in:
 
 ```dockerfile
 FROM lscr.io/linuxserver/sabnzbd:latest
 
-# Add mkvmerge (from MKVToolNix) so the post-processing script can run.
+# Add mkvmerge (from MKVToolNix) and the optional ACL so the post-processing script can run.
 # The LinuxServer.io image is Alpine-based, so use apk.
 RUN apk add --no-cache mkvtoolnix acl
 ```
 
-Build the image (run from the repo root, where the `Dockerfile` lives):
+Build it from the repo root, where the `Dockerfile` lives:
 
-```Bash
+```bash
 docker build -t sabnzbd-mkvstrip .
 ```
 
 Run it in place of the upstream image, mounting `mkv_strip_pp.py` into the container's scripts directory (`/config/scripts`):
 
-```Bash
-docker run -d \
-  --name sabnzbd \
-  -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
-  -p 8080:8080 \
-  -v /path/to/appdata/sabnzbd:/config \
-  -v "$(pwd)/mkv_strip_pp.py":/config/scripts/mkv_strip_pp.py \
-  -v /path/to/downloads:/downloads \
-  --restart unless-stopped \
-  sabnzbd-mkvstrip
-```
-
-Or with Docker Compose:
+If you live in Compose like the rest of us:
 
 ```yaml
 services:
   sabnzbd:
     build: .                 # builds the Dockerfile in this repo
-    # image: sabnzbd-mkvstrip  # (use instead of build: if you built it manually)
     container_name: sabnzbd
     environment:
       - PUID=1000
@@ -80,21 +107,23 @@ services:
     restart: unless-stopped
 ```
 
-```Bash
+```bash
 docker compose up -d --build
 ```
 
-After the container is up, mark the script executable and assign it to your categories in the SABnzbd Web UI as above:
+Once the container is up, mark the script executable and assign it to your categories in the web UI, same as the bare-metal setup above:
 
-```Bash
+```bash
 docker exec sabnzbd chmod +x /config/scripts/mkv_strip_pp.py
 ```
 
-The default `LOG_FILE = "/config/mkv_strip_pp.log"` already points at the persistent `/config` volume.
+The default `LOG_FILE = "/config/mkv_strip_pp.log"` already points at the persistent `/config` volume, so your logs survive a container rebuild.
 
-### Manual Configuration
-Open the script and adjust the top configuration block as needed:
-```Python
+### Manual configuration
+
+Open the script and tweak the config block at the top to match what you actually want kept:
+
+```python
 AUDIO_LANGS = ["eng", "jpn", "und"]
 SUB_LANGS = ["eng", "und"]
 LOG_FILE = "/config/mkv_strip_pp.log"   # Change to a persistent path
@@ -108,36 +137,58 @@ CLEAR_JUNK_TRACK_NAMES = True
 STRIP_ATTACHMENTS = False
 ```
 
-## 2. Library Sweep Engine: `mkvclean`
-   A heavy-duty, self-contained library management script meant to run on a schedule (via cron) or on-demand to clean up existing media folders managed by Radarr.
-   
-   Key Operational Enhancements
-   - High-Speed Scan Engine: Uses os.scandir to traverse directories quickly, fetching stat metadata directly to reduce disk I/O strain on massive arrays.
-   - JSON-Lines Checkpoint File: Tracks processed files by path, size, and modification time (mtime). This allows the script to skip already-cleaned files instantly and resume seamlessly after an interruption. If Radarr upgrades a file later, the script detects the new size/mtime and re-processes it.
-   - Single-Instance Locking: Uses kernel-level file locking (fcntl) to prevent cron jobs and manual runs from overlapping and thrashing your disk array.  
-   - Surrogateescape Path Resilience: Uses robust string error handling to prevent script crashes on files containing complex accents, foreign characters, or broken UTF-8 symbols.
+## 2. Library Sweep Engine: `mkvclean.py`
 
-### Usage Examples
-Manual Run (Default Batch Size: 50 files):
-```Bash
+The hook above only catches new downloads. For the pile of stuff you already have, this is the script that goes back and cleans it. Run it by hand or throw it on a cron job and let it chew through the backlog while you sleep.
+
+First, drop it somewhere on your `PATH` (the scheduled examples below assume this) and make it executable:
+
+```bash
+sudo cp mkvclean.py /usr/local/bin/
+sudo chmod +x /usr/local/bin/mkvclean.py
+```
+
+### How it stays out of its own way
+
+Running a strip across a massive array is exactly where naive scripts thrash your disks or trip over each other. A few things keep that from happening:
+
+- **High-speed scan engine:** uses `os.scandir` to walk directories fast and pull `stat` metadata directly, which keeps disk I/O off the floor on big arrays.
+- **JSON-lines checkpoint file:** tracks every processed file by path, size, and mtime, so already-cleaned files get skipped instantly and an interrupted run resumes right where it stopped. If Radarr upgrades a file later, the new size/mtime gives it away and the script re-cleans it.
+- **Single-instance locking:** kernel-level file locking (`fcntl`) means a manual run and a cron job can't fire at the same time and grind your array into paste.
+- **Surrogateescape path resilience:** the script handles filenames full of accents, foreign characters, or busted UTF-8 without crashing.
+
+### Usage examples
+
+Manual run (default batch size: 50 files):
+
+```bash
 ./mkvclean.py /media/Storage/Movies
 ```
-Process the Entire Library with No Limits:
-```Bash
+
+Process the entire library, no batch limit:
+
+```bash
 ./mkvclean.py /media/Storage --batch 0
 ```
-Dry Run (See what would be stripped without making changes):
-```Bash
+
+Dry run (see exactly what it would strip without touching a single file):
+
+```bash
 ./mkvclean.py /media/Storage --dry-run
 ```
 
-### Scheduled Catch-All Cron Configuration
-Add this to your crontab to run a sweep every night at 4:00 AM. The script uses a custom log path and the built-in lock file to ensure it runs safely in the background:
+Always do a dry run first on a new library. Look at the log, confirm it's keeping what you expect, then set it loose.
+
+### Scheduled catch-all cron configuration
+
+Drop this in your crontab to sweep every night at 4 AM. The custom log path and the built-in lock file keep it safe to run unattended:
+
 ```bash
 0 4 * * * /usr/local/bin/mkvclean.py /media/Storage/Movies --batch 0 --log ~/mkvclean-cron.log
 ```
 
 ## CLI Arguments
+
 ```
 positional arguments:
   root                  Library root to scan recursively (default: /media/Storage)
@@ -167,31 +218,32 @@ options:
 ```
 
 ## Prerequisites
-- Python 3.6+
-- MKVToolNix Suite (`mkvmerge`): 
-  Ensure the `mkvmerge` binary is installed and accessible via your system's PATH.
+
+- **Python 3.13+** (built and tested on 3.13.5)
+- **MKVToolNix (`mkvmerge`):** the binary needs to be installed and on your `PATH`.
   - Ubuntu/Debian: `sudo apt install mkvtoolnix`
   - Alpine (Docker containers): `apk add mkvtoolnix`
-- Optional — `acl` (`getfacl`/`setfacl`): only needed if you want POSIX ACLs copied onto cleaned files. Without it, ACL preservation is skipped silently; all other metadata (ownership, mode, timestamps, xattrs) is still preserved.
+- **Optional, `acl` (`getfacl`/`setfacl`):** only matters if you want POSIX ACLs copied onto cleaned files. Skip it and ACL preservation is silently skipped too; everything else (ownership, mode, timestamps, xattrs) is still preserved.
   - Ubuntu/Debian: `sudo apt install acl`
   - Alpine: `apk add acl`
 
-> **Docker users:** the included `Dockerfile` installs both `mkvtoolnix` and `acl` on top of the LinuxServer.io SABnzbd image, so no manual dependency setup is needed — see [Docker (LinuxServer.io SABnzbd)](#docker-linuxserverio-sabnzbd).
+> **Docker users:** the included `Dockerfile` installs both `mkvtoolnix` and `acl` on top of the LinuxServer.io SABnzbd image, so there's nothing to set up by hand. See [Docker (LinuxServer.io SABnzbd)](#docker-linuxserverio-sabnzbd).
 
 ## Troubleshooting
 
 ### `Could not preserve ownership (uid=… gid=…) … Operation not permitted`
 
-This is a **non-fatal warning, not a failure.** The track stripping still completed: `mkvmerge` remuxed the file and it was atomically swapped into place. The only side effect is that the cleaned file is now owned by the user that ran the script instead of the original owner.
+Relax, this one's a **warning, not a failure.** The strip already finished: `mkvmerge` remuxed the file and it was atomically swapped into place. The only catch is that the cleaned file now belongs to whoever ran the script instead of the original owner.
 
-It happens because changing a file's owner to an *arbitrary* uid/gid requires `CAP_CHOWN` (effectively root). When the script runs as a non-root user that doesn't already own the files, the kernel denies the `chown` with `EPERM`, and the script logs the warning and continues by design.
+Here's why it happens. Changing a file's owner to some *arbitrary* uid/gid needs `CAP_CHOWN`, which in practice means root. When the script runs as a non-root user that doesn't already own the files, the kernel slaps the `chown` with `EPERM`, so the script logs it and keeps moving by design rather than dying on the spot.
 
-To preserve the original ownership, run with enough privilege to perform the `chown`:
+If you want the original ownership preserved, give it enough privilege to do the `chown`:
 
-- **Bare-metal / cron:** run as root, e.g. `sudo ./mkvclean.py /media/Storage/Movies` (or schedule the cron job under root's crontab).
-- **Docker (LinuxServer.io):** set `PUID`/`PGID` to match the media files' owner so the process *is* the owner. Note that matching the uid alone still won't let it set a different gid unless the process is a member of that group.
+- **Bare-metal / cron:** run it as root, e.g. `sudo ./mkvclean.py /media/Storage/Movies`, or put the cron job in root's crontab.
+- **Docker (LinuxServer.io):** set `PUID`/`PGID` to match the media files' owner so the process *is* the owner. Matching the uid alone still won't let it set a different gid unless the process is in that group, so watch out for that.
 
-If you don't care about the ownership ending up as the runner, the warning is safe to ignore.
+And if you don't care who ends up owning the files, ignore the warning entirely. It changes nothing about the actual cleanup.
 
 ## License
-This project is open-source and available under the MIT License. See [LICENSE](LICENSE) for details.
+
+Open-source under the MIT License. See [LICENSE](LICENSE) for details.

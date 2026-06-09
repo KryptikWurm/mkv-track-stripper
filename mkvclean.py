@@ -31,8 +31,7 @@ JUNK_AUDIO_NAME_PATTERNS = ("commentary", "description", "director", "dvs")
 # Same set plus SDH, used by the cosmetic track-name cleanup pass.
 JUNK_NAME_PATTERNS = JUNK_AUDIO_NAME_PATTERNS + ("sdh",)
 
-# Language words that may appear in a track name -> ISO 639-2 code, used to fill
-# an undefined ('und') track language so the language filter can act on it.
+# Language words that may appear in a track name -> ISO 639-2 code, used to fill an undefined ('und') track language so the language filter can act on it.
 LANG_NAME_MAP = {
     "english": "eng",
     "japanese": "jpn",
@@ -49,8 +48,7 @@ LANG_NAME_MAP = {
     "arabic": "ara",
 }
 
-# Which extra cleanup passes to run. Title/tags/language fill and junk-name
-# clearing default on; attachment removal is opt-in (fonts can matter for subs).
+# Which extra cleanup passes to run. Title/tags/language fill and junk-name clearing default on; attachment removal is opt-in (fonts can matter for subs).
 Cleanup = namedtuple("Cleanup", "title tags infer_lang track_names attachments")
 DEFAULT_CLEANUP = Cleanup(title=True, tags=True, infer_lang=True, track_names=True, attachments=False)
 
@@ -81,9 +79,7 @@ def select_tracks(info, audio_langs, sub_langs, prefer_channels=None):
             lang = props.get("language")
             track_name = str(props.get("track_name", "")).lower()
 
-            # Junk audio: prefer the explicit Matroska flags (these catch untitled
-            # or non-English commentary / audio-description tracks that the name
-            # match misses); fall back to the track-name substring check.
+            # Junk audio: prefer the explicit Matroska flags (these catch untitled or non-English commentary / audio-description tracks that the name match misses); fall back to the track-name substring check.
             is_junk = (
                 props.get("flag_commentary")
                 or props.get("flag_visual_impaired")
@@ -96,12 +92,9 @@ def select_tracks(info, audio_langs, sub_langs, prefer_channels=None):
         if not keep_audio:
             keep_audio = list(all_audio)
 
-        # Collapse English audio to a single track ONLY when a preferred channel
-        # count is configured (--prefer-audio-channels); without it, all matching
-        # English tracks are kept. A track whose channel count equals the
-        # preferred value wins outright, otherwise the one with the most channels
-        # (ties break by file order). English only — other languages keep all
-        # their matching tracks.
+        # Collapse English audio to a single track ONLY when a preferred channel count is configured (--prefer-audio-channels); without it, all matching English tracks are kept.
+        # A track whose channel count equals the preferred value wins outright, otherwise the one with the most channels (ties break by file order).
+        # English only — other languages keep all their matching tracks.
         if prefer_channels is not None:
             eng_ids = [t["id"] for t in audio
                        if t["id"] in keep_audio
@@ -120,8 +113,7 @@ def select_tracks(info, audio_langs, sub_langs, prefer_channels=None):
         is_forced = props.get("forced_track") or "forced" in track_name
         is_sdh = props.get("flag_hearing_impaired") or "sdh" in track_name
 
-        # Forced subs are always kept. Otherwise keep preferred languages but drop
-        # SDH / hearing-impaired tracks (flag preferred, "sdh" name as fallback).
+        # Forced subs are always kept. Otherwise keep preferred languages but drop SDH / hearing-impaired tracks (flag preferred, "sdh" name as fallback).
         if is_forced:
             keep_subs.append(t["id"])
         elif lang in sub_langs and not is_sdh:
@@ -325,10 +317,10 @@ def strip_in_place(path, keep_audio, keep_subs, mkvmerge="mkvmerge", extra_args=
     orig_stat = os.stat(path)
     fd, tmp = tempfile.mkstemp(suffix=".mkv", prefix=".mkvclean_", dir=folder)
     os.close(fd)
-    
+
     try:
         cmd = [mkvmerge, "-o", tmp]
-        
+
         if keep_audio:
             cmd += ["--audio-tracks", ",".join(map(str, keep_audio))]
             # Exactly one default audio track: the first kept track; clear the rest
@@ -337,15 +329,14 @@ def strip_in_place(path, keep_audio, keep_subs, mkvmerge="mkvmerge", extra_args=
                 cmd += ["--default-track-flag", f"{tid}:{1 if i == 0 else 0}"]
         else:
             cmd += ["--no-audio"]
-            
+
         if keep_subs:
             cmd += ["--subtitle-tracks", ",".join(map(str, keep_subs))]
             cmd += ["--default-track-flag", f"{keep_subs[0]}:0"]
         else:
             cmd += ["--no-subtitles"]
 
-        # Cleanup passes (title/tags/attachments/track-names/language). These are
-        # global or source-track options, so they must precede the input file.
+        # Cleanup passes (title/tags/attachments/track-names/language). These are global or source-track options, so they must precede the input file.
         if extra_args:
             cmd += extra_args
 
@@ -367,7 +358,7 @@ def strip_in_place(path, keep_audio, keep_subs, mkvmerge="mkvmerge", extra_args=
         preserve_metadata(path, tmp, orig_stat)
         os.replace(tmp, path)
         return "stripped"
-        
+
     except Exception as e:
         log.error("  Failed during remux processing: %s", e)
         return "error"
@@ -413,10 +404,7 @@ def process_file(path, audio_langs, sub_langs, mkvmerge="mkvmerge", mkvpropedit=
 
     keep_audio, keep_subs, all_audio, all_subs, nothing = select_tracks(info, audio_langs, sub_langs, prefer_channels)
     if nothing:
-        # No tracks to strip, but the header may still need work: a wrong
-        # default-audio flag, a stray title/tags, junk track names, inferred
-        # languages or attachments to drop. Fix those in place with mkvpropedit
-        # (no remux, no temp file, no disk-space check) rather than rewriting it.
+        # No tracks to strip, but the header may still need work: a wrong default-audio flag, a stray title/tags, junk track names, inferred languages or attachments to drop. Fix those in place with mkvpropedit (no remux, no temp file, no disk-space check) rather than rewriting it.
         edits = plan_metadata_fixes(info, keep_audio, lang_fixes, cleanup)
         if not edits:
             return "nothing"
@@ -649,7 +637,7 @@ def main():
                     done[path] = append_checkpoint(args.checkpoint, path)
             else:
                 errors += 1
-                
+
     except KeyboardInterrupt:
         interrupted = True
         log.info("Interrupted. Re-run to resume where you left off.")

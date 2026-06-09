@@ -53,9 +53,10 @@ Cleanup = namedtuple("Cleanup", "title tags infer_lang track_names attachments")
 DEFAULT_CLEANUP = Cleanup(title=True, tags=True, infer_lang=True, track_names=True, attachments=False)
 
 def probe(path, mkvmerge="mkvmerge"):
-    out = subprocess.run(
-        [mkvmerge, "-J", path], capture_output=True, text=True, check=True
-    )
+    # mkvmerge -J exits 1 for warnings but still emits valid JSON; only >=2 is a real failure.
+    out = subprocess.run([mkvmerge, "-J", path], capture_output=True, text=True)
+    if out.returncode >= 2:
+        raise subprocess.CalledProcessError(out.returncode, out.args, out.stdout, out.stderr)
     return json.loads(out.stdout)
 
 def select_tracks(info, audio_langs, sub_langs, prefer_channels=None):
@@ -175,8 +176,8 @@ def _track_selectors(tracks):
 def plan_metadata_fixes(info, keep_audio, lang_fixes, cleanup):
     """Header-only edits a kept-as-is file still needs, as mkvpropedit argument
     groups (empty if the header is already clean). Enforces exactly one
-    default-audio flag (first kept track), fills inferred languages, and runs the
-    cleanup passes: strip the global title, wipe tags, clear junk track names and
+    default-audio flag (first kept track), clears default-subtitle flags, fills
+    inferred languages, and runs the cleanup passes: strip the global title, wipe tags, clear junk track names and
     drop attachments. Used only when no tracks are stripped, so the per-type track
     ordinals (track:aN/sN) line up with the file's track order."""
     edits = []
@@ -190,6 +191,11 @@ def plan_metadata_fixes(info, keep_audio, lang_fixes, cleanup):
         if is_default != want_default:
             edits.append(["--edit", f"track:a{n}",
                           "--set", f"flag-default={1 if want_default else 0}"])
+
+    # No default subtitle track: clear stale default flags, matching the remux path.
+    for t in tracks:
+        if t.get("type") == "subtitles" and t.get("properties", {}).get("default_track"):
+            edits.append(["--edit", f"track:{sel[t['id']]}", "--set", "flag-default=0"])
 
     # Persist languages inferred from the track name onto 'und' tracks.
     for tid, code in lang_fixes.items():
@@ -332,7 +338,10 @@ def strip_in_place(path, keep_audio, keep_subs, mkvmerge="mkvmerge", extra_args=
 
         if keep_subs:
             cmd += ["--subtitle-tracks", ",".join(map(str, keep_subs))]
-            cmd += ["--default-track-flag", f"{keep_subs[0]}:0"]
+            # No default subtitle track: clear the flag on every kept sub so a
+            # stale default carried over from the source can't survive.
+            for tid in keep_subs:
+                cmd += ["--default-track-flag", f"{tid}:0"]
         else:
             cmd += ["--no-subtitles"]
 
@@ -483,10 +492,12 @@ def load_checkpoint(path):
                 line = line.strip()
                 if not line:
                     continue
+                # Count every non-blank line (including unparseable ones) so
+                # compaction rewrites the file and sheds corrupt entries.
+                raw_lines += 1
                 try:
                     p, mt, sz = json.loads(line)
                     done[p] = (mt, sz)
-                    raw_lines += 1
                 except (ValueError, TypeError):
                     pass
     return done, raw_lines
@@ -579,6 +590,12 @@ def main():
     if not os.path.isdir(args.root):
         log.error("Root '%s' does not exist.", args.root)
         return 1
+
+    # Fail fast on a missing binary instead of logging one error per file.
+    for binary in (args.mkvmerge, args.mkvpropedit):
+        if not (shutil.which(binary) or os.path.isfile(binary)):
+            log.error("'%s' not found. Ensure MKVToolNix is installed.", binary)
+            return 1
 
     audio_langs = [s.strip() for s in args.audio.split(",") if s.strip()]
     sub_langs = [s.strip() for s in args.subs.split(",") if s.strip()]

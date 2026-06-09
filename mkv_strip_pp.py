@@ -75,9 +75,10 @@ CLEANUP = Cleanup(
 )
 
 def probe(path, mkvmerge="mkvmerge"):
-    out = subprocess.run(
-        [mkvmerge, "-J", path], capture_output=True, text=True, check=True
-    )
+    # mkvmerge -J exits 1 for warnings but still emits valid JSON; only >=2 is a real failure.
+    out = subprocess.run([mkvmerge, "-J", path], capture_output=True, text=True)
+    if out.returncode >= 2:
+        raise subprocess.CalledProcessError(out.returncode, out.args, out.stdout, out.stderr)
     return json.loads(out.stdout)
 
 def select_tracks(info, audio_langs, sub_langs):
@@ -177,8 +178,8 @@ def _track_selectors(tracks):
 def plan_metadata_fixes(info, keep_audio, lang_fixes, cleanup):
     """Header-only edits a kept-as-is file still needs, as mkvpropedit argument
     groups (empty if the header is already clean). Enforces exactly one
-    default-audio flag (first kept track), fills inferred languages, and runs the
-    cleanup passes: strip the global title, wipe tags, clear junk track names and
+    default-audio flag (first kept track), clears default-subtitle flags, fills
+    inferred languages, and runs the cleanup passes: strip the global title, wipe tags, clear junk track names and
     drop attachments. Used only when no tracks are stripped, so the per-type track
     ordinals (track:aN/sN) line up with the file's track order."""
     edits = []
@@ -192,6 +193,11 @@ def plan_metadata_fixes(info, keep_audio, lang_fixes, cleanup):
         if is_default != want_default:
             edits.append(["--edit", f"track:a{n}",
                           "--set", f"flag-default={1 if want_default else 0}"])
+
+    # No default subtitle track: clear stale default flags, matching the remux path.
+    for t in tracks:
+        if t.get("type") == "subtitles" and t.get("properties", {}).get("default_track"):
+            edits.append(["--edit", f"track:{sel[t['id']]}", "--set", "flag-default=0"])
 
     # Persist languages inferred from the track name onto 'und' tracks.
     for tid, code in lang_fixes.items():
@@ -333,7 +339,10 @@ def strip_in_place(path, keep_audio, keep_subs, mkvmerge="mkvmerge", extra_args=
 
         if keep_subs:
             cmd += ["--subtitle-tracks", ",".join(map(str, keep_subs))]
-            cmd += ["--default-track-flag", f"{keep_subs[0]}:0"]
+            # No default subtitle track: clear the flag on every kept sub so a
+            # stale default carried over from the source can't survive.
+            for tid in keep_subs:
+                cmd += ["--default-track-flag", f"{tid}:0"]
         else:
             cmd += ["--no-subtitles"]
 
@@ -433,15 +442,20 @@ def process_file(path, audio_langs, sub_langs, mkvmerge="mkvmerge", mkvpropedit=
 def setup_logging():
     log.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s")
-    log_dir = os.path.dirname(LOG_FILE)
-    if log_dir and not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     log.addHandler(sh)
+    # Best-effort log file: SABnzbd captures stdout, so an unwritable LOG_FILE
+    # must not crash the post-processor (a non-zero exit would fail the job).
+    try:
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        fh = logging.FileHandler(LOG_FILE, encoding="utf-8", errors="surrogateescape")
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+    except OSError as e:
+        log.warning("Could not open log file %s (%s); logging to stdout only.", LOG_FILE, e)
 
 def get_job_dir():
     d = os.environ.get("SAB_COMPLETE_DIR")

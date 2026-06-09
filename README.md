@@ -219,7 +219,7 @@ options:
 
 ## Prerequisites
 
-- **Python 3.13+** (built and tested on 3.13.5)
+- **Python 3.10+** (built and tested on 3.13.5)
 - **MKVToolNix (`mkvmerge`):** the binary needs to be installed and on your `PATH`.
   - Ubuntu/Debian: `sudo apt install mkvtoolnix`
   - Alpine (Docker containers): `apk add mkvtoolnix`

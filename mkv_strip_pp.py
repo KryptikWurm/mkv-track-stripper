@@ -42,8 +42,26 @@ STRIP_ATTACHMENTS = False
 
 log = logging.getLogger("mkvclean")
 
-# Track-name substrings that mark junk audio (commentary / descriptive / DVS).
-JUNK_AUDIO_NAME_PATTERNS = ("commentary", "description", "director", "dvs")
+# Track-name substrings that mark junk audio (commentary / descriptive audio for the
+# visually impaired / DVS). Matched as substrings, so several are deliberately stems:
+# "descri" covers description/descriptive/described, "narrat" covers narration/narrated
+# and "impair" covers "visually impaired" / "visual impaired".
+JUNK_AUDIO_NAME_PATTERNS = (
+    "commentary",
+    "descri",
+    "director",
+    "dvs",
+    "narrat",
+    "impair",
+    "audiovision",
+    "audio vision",
+)
+# Short descriptive-audio markers that are only safe as whole words: as substrings "ad"
+# would fire on "advert"/"loaded" and "vi" on any roman numeral or "video".
+JUNK_AUDIO_NAME_WORDS = ("ad", "ads")
+_JUNK_AUDIO_WORD_RE = re.compile(
+    r"(?<![a-z0-9])(?:" + "|".join(JUNK_AUDIO_NAME_WORDS) + r")(?![a-z0-9])"
+)
 # Same set plus SDH, used by the cosmetic track-name cleanup pass.
 JUNK_NAME_PATTERNS = JUNK_AUDIO_NAME_PATTERNS + ("sdh",)
 
@@ -91,7 +109,10 @@ def select_tracks(info, audio_langs, sub_langs):
     if len(audio) <= 1:
         keep_audio = list(all_audio)
     else:
-        has_eng_audio = any(t.get("properties", {}).get("language") == "eng" for t in audio)
+        # Junk tracks don't count as "real" English audio, otherwise a file whose only eng
+        # track is an audio description would drop the und tracks and keep the description.
+        has_eng_audio = any(t.get("properties", {}).get("language") == "eng"
+                            and not is_junk_audio(t.get("properties", {})) for t in audio)
         target_audio_langs = list(audio_langs)
         if has_eng_audio and "und" in target_audio_langs:
             target_audio_langs.remove("und")
@@ -100,20 +121,14 @@ def select_tracks(info, audio_langs, sub_langs):
         for t in audio:
             props = t.get("properties", {})
             lang = props.get("language")
-            track_name = str(props.get("track_name", "")).lower()
 
-            # Junk audio: prefer the explicit Matroska flags (these catch untitled or non-English commentary / audio-description tracks that the name match misses); fall back to the track-name substring check.
-            is_junk = (
-                props.get("flag_commentary")
-                or props.get("flag_visual_impaired")
-                or any(x in track_name for x in JUNK_AUDIO_NAME_PATTERNS)
-            )
-
-            if lang in target_audio_langs and not is_junk:
+            if lang in target_audio_langs and not is_junk_audio(props):
                 keep_audio.append(t["id"])
 
         if not keep_audio:
-            keep_audio = list(all_audio)
+            # Nothing matched the language filter. Fall back to the original tracks, but never
+            # resurrect commentary / descriptive-audio tracks unless they are the only audio there is.
+            keep_audio = [t["id"] for t in audio if not is_junk_audio(t.get("properties", {}))] or list(all_audio)
 
     keep_subs = []
     for t in subs:
@@ -142,10 +157,27 @@ def infer_language(track_name):
             return code
     return None
 
+def is_junk_audio(props):
+    """True if an audio track is commentary or descriptive audio for the visually impaired.
+
+    Prefers the explicit Matroska flags - they catch untitled or non-English tracks the
+    name match misses - and falls back to the track-name markers. `flag_text_descriptions`
+    is the flag muxers set for text-to-speech / audio-description streams, so it counts
+    alongside `flag_visual_impaired`.
+    """
+    name = str(props.get("track_name", "")).lower()
+    return bool(
+        props.get("flag_commentary")
+        or props.get("flag_visual_impaired")
+        or props.get("flag_text_descriptions")
+        or any(x in name for x in JUNK_AUDIO_NAME_PATTERNS)
+        or _JUNK_AUDIO_WORD_RE.search(name)
+    )
+
 def _is_junk_name(track_name):
     """True if a track name looks like commentary / descriptive / SDH junk."""
     name = str(track_name or "").lower()
-    return any(p in name for p in JUNK_NAME_PATTERNS)
+    return any(p in name for p in JUNK_NAME_PATTERNS) or bool(_JUNK_AUDIO_WORD_RE.search(name))
 
 def apply_language_inference(info):
     """Fill an undefined ('und'/missing) track language from the language named in
